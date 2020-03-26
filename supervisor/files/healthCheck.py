@@ -117,8 +117,8 @@ def get_proc_rss(pid, cumulative=False):
 
         procs = []
         for line in data.splitlines():
-            pid, ppid, rss = map(int, line.split())
-            procs.append(ProcInfo(pid=pid, ppid=ppid, rss=rss))
+            p_pid, p_ppid, p_rss = map(int, line.split())
+            procs.append(ProcInfo(pid=p_pid, ppid=p_ppid, rss=p_rss))
 
         # 计算rss
         try:
@@ -262,7 +262,6 @@ class HealthCheck(object):
         initialDelaySeconds = config.get('initialDelaySeconds', self.initialDelaySeconds)
         sendResolved = config.get('sendResolved', self.sendResolved)
         action_type = config.get('action', 'restart')
-        action_exec_cmd = config.get('execCmd')
 
         check_type = config.get('type', 'HTTP').lower()
         check_method = self.http_check
@@ -274,7 +273,7 @@ class HealthCheck(object):
         elif check_type == 'cpu':
             check_method = self.cpu_check
 
-        while True:
+        while 1:
             if program not in check_state:
                 check_state[program] = {
                     'periodSeconds': 1,
@@ -299,7 +298,8 @@ class HealthCheck(object):
 
                 # 先判断成功次数
                 if check_state[program]['success'] >= successThreshold:
-                    if sendResolved and check_state[program]['failure'] > 0:
+                    # 只有开启恢复通知和检测失败并且执行操作后,才可以发送恢复通知
+                    if sendResolved and check_state[program]['action']:
                         # 只保留通知action
                         notice_action = ['email', 'wechat']
                         send_action = ','.join(list(set(action_type.split(',')) & set(notice_action)))
@@ -318,15 +318,15 @@ class HealthCheck(object):
 
                 # 再判断失败次数
                 if check_state[program]['failure'] >= failureThreshold:
-                    # 失败后, 只触发一次action，或者检测错误数可以整除2倍periodSeconds与initialDelaySeconds时触发(避免重启失败导致服务一直不可用)
+                    # 失败后, 只触发一次action, 或者检测错误数可以整除2倍periodSeconds与initialDelaySeconds时触发(避免重启失败导致服务一直不可用)
                     if not check_state[program]['action'] or (
                             check_state[program]['failure'] != 0 and check_state[program]['failure'] % (
                             (periodSeconds + initialDelaySeconds) * 2) == 0):
                         action_param = {
+						    'config': config,
                             'action_type': action_type,
                             'check_status': check_status,
-                            'msg': check_result.get('msg', ''),
-                            'action_exec_cmd': action_exec_cmd
+                            'msg': check_result.get('msg', '')
                         }
                         self.action(program, **action_param)
                         check_state[program]['action'] = True
@@ -484,25 +484,32 @@ class HealthCheck(object):
         """
         action_type = args.get('action_type')
         msg = args.get('msg')
-        action_exec_cmd = args.get('action_exec_cmd')
         check_status = args.get('check_status')
-
+        config = args.get('config')
+		
         self.log(program, 'Action: %s', action_type)
         action_list = action_type.split(',')
 
         if 'restart' in action_list:
-            restart_result = self.action_supervistor_restart(program)
+            restart_result = self.action_supervisor_restart(program)
             msg += '\r\n Restart：%s' % restart_result
         elif 'exec' in action_list:
+            action_exec_cmd = config.get('action_exec_cmd')
             exec_result = self.action_exec(program, action_exec_cmd)
             msg += '\r\n Exec：%s' % exec_result
+        elif 'kill' in action_list:
+            pid_get = config.get('pidGet', 'supervisor')
+            pid_file = config.get('pidFile', )
+            pid, err = self.get_pid(program, pid_get, pid_file)
+            kill_result = self.action_kill(program, pid)
+            msg += '\r\n Kill：%s' % kill_result
 
         if 'email' in action_list and self.mail_config:
             self.action_email(program, action_type, msg, check_status)
         if 'wechat' in action_list and self.wechat_config:
             self.action_wechat(program, action_type, msg, check_status)
 
-    def action_supervistor_restart(self, program):
+    def action_supervisor_restart(self, program):
         """
         通过supervisor的rpc接口重启进程
         :param program:
@@ -560,6 +567,30 @@ class HealthCheck(object):
         else:
             result = 'Failed to exec %s, exiting: %s' % (program, exitcode)
             self.log(program, "Action: exec result %s", result)
+
+        return result
+		
+    def action_kill(self, program, pid):
+        """
+        杀死进程
+        :param program:
+        :param pid:
+        :return:
+        """ 
+        self.log(program, 'Action: kill')
+        result = 'success'
+		
+        if int(pid) < 3:
+            return 'Failed to kill %s, pid: %s '% (program, pid)
+		  
+        cmd = "kill -9 %s" % pid
+        exitcode, stdout, stderr = shell(cmd)
+
+        if exitcode == 0:
+            self.log(program, "Action: kill result success")
+        else:
+            result = 'Failed to kill %s, pid: %s exiting: %s' % (program, pid, exitcode)
+            self.log(program, "Action: kill result %s", result)
 
         return result
 
@@ -740,11 +771,17 @@ class HealthCheck(object):
             t = threading.Thread(target=self.check, args=(item,))
             threads.append(t)
         for t in threads:
-            t.setDaemon(True)
-            t.start()
-
-        while True:
-            pass
+            try:
+                t.setDaemon(True)
+                t.start()
+            except Exception, e:
+                print('Exception in ' + t.getName() + ' (catch by main)')
+                print(t.exc_traceback)
+                t.setDaemon(True)
+                t.start()
+                
+        while 1:
+            time.sleep(0.1)
 
 
 if __name__ == '__main__':
@@ -785,7 +822,7 @@ cat1:                     # supervisor中配置的program名称
   type: mem               # 检查类型: http,tcp,mem,cpu  默认: http
   maxRss: 1024            # 内存阈值, 超过则为检测失败. 单位MB, 默认: 1024
   cumulative: True        # 是否统计子进程的内存, 默认: False
-  pidGet: supervistor     # 获取pid的方式: supervistor,name,file, 选择name时,按program名称搜索pid,选择file时,需指定pidFile 默认: supervistor
+  pidGet: supervisor      # 获取pid的方式: supervisor,name,file, 选择name时,按program名称搜索pid,选择file时,需指定pidFile 默认: supervisor
   pidFile: /var/run/t.pid # 指定pid文件的路径, 只在pidGet为file的时候有用
   periodSeconds: 10       # 检查的频率(以秒为单位), 默认: 5
   initialDelaySeconds: 10 # 首次检查等待的时间(以秒为单位), 默认: 1
@@ -799,7 +836,7 @@ cat1:                     # supervisor中配置的program名称
 cat2:                     # supervisor中配置的program名称
   type: cpu               # 检查类型: http,tcp,mem,cpu 默认: http
   maxCpu: 80              # CPU阈值, 超过则为检测失败. 单位% 默认: 90%
-  pidGet: supervistor     # 获取pid的方式: supervistor,name,file, 选择name时,按program名称搜索pid,选择file时,需指定pidFile 默认: supervistor
+  pidGet: supervisor      # 获取pid的方式: supervisor,name,file, 选择name时,按program名称搜索pid,选择file时,需指定pidFile 默认: supervisor
   pidFile: /var/run/t.pid # 指定pid文件的路径, 只在pidGet为file的时候有用
   periodSeconds: 10       # 检查的频率(以秒为单位), 默认: 5
   initialDelaySeconds: 10 # 首次检查等待的时间(以秒为单位), 默认: 1
